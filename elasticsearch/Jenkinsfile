@@ -1,0 +1,353 @@
+//Variable Declaration
+bucket_name = ""
+protocol = ""
+host_ip = ""
+instance_name = ""
+bucket_name = ""
+cluster_type = ""
+cluster_name = ""
+master_ip = ""
+node_count = ""
+master_hostname = ""
+master_node = ""
+data_node = ""
+cloud = ""
+secure_cluster = ""
+//Pipeline declaration
+pipeline {
+    agent none
+    options {
+        buildDiscarder (
+            logRotator (
+                artifactDaysToKeepStr: '',
+                artifactNumToKeepStr: '5',
+                daysToKeepStr: '',
+                numToKeepStr: '5'
+            )
+        )
+        disableConcurrentBuilds()
+    }
+    parameters{
+        choice(
+            choices: ['Ferma-Sandbox','Zoomrx-Sandbox'],
+            description: 'Select the Jenkins Agent',
+            name: 'agent_name'
+        )
+        choice(
+            choices: ['new','bcdr'],
+            description: 'Select the type of installation',
+            name: 'install_type'
+        )
+        choice(
+            choices: ['7.5.1','7.5.3','7.6.1'],
+            description: 'Select the ES Cluster version',
+            name: 'es_version'
+        )       
+    }
+    stages {
+        //Repo Check out
+        stage('Check out'){
+            agent { label "${params.agent_name}" }
+            steps {
+                echo "${env.WORKSPACE}"
+                script {
+                    println("Checking if our arena is empty or not.......")
+                    if (fileExists("/")){
+                        println("Somethings exists in our arena!!!")
+                        cleanWs()
+                        println("Arena is cleared now, we are ready to go..!")
+                    }
+                    println("Importing all necessary files")
+                    git branch: 'dev', changelog: false, credentialsId: 'kg-ldap', poll: false, url: 'https://phab.zoomrx.com/source/bcdr.git'
+                    if(("${params.agent_name}".toString() == 'Zoomrx-Sandbox') || ("${params.agent_name}".toString() == 'Master')){
+                        protocol = "s3+http"
+                        cloud = "aws"
+                    }
+                    else {
+                        protocol = "gs"
+                        cloud = "gcp"
+                    }
+                }
+            }
+        }
+        stage('BCDR Input'){
+            agent { label "${params.agent_name}" }
+            when {
+                expression { "${params.install_type}".toString() == 'bcdr' ;}
+            }
+            steps {
+                script {
+                    def bcdrInput = input(
+                        id: 'bcdrInput',  message: 'Enter the required details for bcdr:',
+                        parameters: [
+                            string(
+                                defaultValue: 'None',
+                                description: 'Enter the Host IP to install ES',
+                                name: 'ip'),
+                            string(
+                                defaultValue: 'None',
+                                description: 'Enter the Configuration backup Bucket Name ',
+                                name: 'bucket_name'),
+                            choice(
+                                choices: ['elastic-master','data-node-1','data-node-2'],
+                                description: 'Select the configuration file of the instance',
+                                name: 'host_name')        
+                        ]
+                    )
+                    host_ip = bcdrInput.ip?:''
+                    bucket_name = bcdrInput.bucket_name?:''
+                    instance_name = bcdrInput.host_name?:''
+                }
+            }
+        }
+        stage('Dump Importing'){
+            agent { label "${params.agent_name}" }
+            when {
+                expression { "${params.install_type}".toString() == 'bcdr' ;}
+            }
+            steps{
+                script{
+                    println("Importing configuration files")
+                    sh "mkdir -p backup_files"
+                    //bucket_name = "congress-web-backup"
+                    //protocol = "gs"
+                    println(host_ip)
+                    println(instance_name)
+                    println(bucket_name)
+                    println(protocol)
+                    dir('backup_files'){    
+                            sh(script: "/usr/local/bin/duplicity restore --no-encryption $protocol://$bucket_name/web/$instance_name/elasticsearch es_config.gz", returnStdout: true)
+                    }        
+                }
+            }
+            post{
+                success{
+                    println("Configuration files imported successfully")
+                    println("Copying files to Playbook")
+                    script{
+                        dir('backup_files'){
+                            sh(script: "tar xvzf es_config.gz", returnStdout: true)
+                            sh(script: "sudo cp -r elasticsearch/* $WORKSPACE/Playbooks/roles/elasticsearch/files/")    
+                        }
+                    }    
+                }
+            }                
+        }
+        stage('Input for New ES Cluster'){
+            agent { label "${params.agent_name}" }
+            when {
+                expression { "${params.install_type}".toString() == 'new' ;}
+            }
+            steps{
+                script{
+                    println("Input for New ES Cluster")
+                    def clusterInput = input(
+                        id: 'clusterInput', message: 'Enter the required details for New ES Cluster Installation:',
+                        parameters: [
+                            choice(
+                                choices: ['singlenode','multinode'],
+                                description: 'Select the Cluster Type',
+                                name: 'cluster_type')
+                        ]
+                    )
+                    cluster_type = clusterInput
+                    //cluster_type = userInput.test()?:''
+                    println(cluster_type)
+                    if("$cluster_type".toString() == 'singlenode'){
+                        def singleInput = input(
+                            id: 'singleInput', message: 'Enter the required details for New ES Cluster Installation:',
+                            parameters: [
+                                string(
+                                    description: 'Enter the Cluster Name',
+                                    name: 'cluster_name'),
+                                string(
+                                    description: 'Enter the Host External IP',
+                                    name: 'ext_ip'),
+                                string(
+                                    description: 'Enter the Host Internal IP',
+                                    name: 'int_ip'),
+                                choice(
+                                    choices: ['true','false'],
+                                    description: 'Select true,if passwords need to generate for builtin user',
+                                    name: 'secure_cluster')
+                            ]
+                        )
+                        cluster_name = singleInput.cluster_name?:''
+                        host_ip = singleInput.ext_ip?:''
+                        instance_name = singleInput.cluster_name?:''
+                        master_ip = singleInput.int_ip?:''
+                        secure_cluster = singleInput.secure_cluster?:''
+                    }
+                    else if ("$cluster_type".toString() == 'multinode'){
+                        def multiInput = input(
+                            id: 'multiInput', message: 'Enter the required details for New ES Cluster Installation:',
+                            parameters: [
+                                string(
+                                    description: 'Enter the Cluster Name',
+                                    name: 'cluster_name'),
+                                string(
+                                    description: 'Enter the Number of data nodes in the cluster',
+                                    name: 'node_count'),
+                                string(
+                                    description: 'Enter the External IP Address of Master Node',
+                                    name: 'external_ip'),
+                                string(
+                                    description: 'Enter the Internal IP Address of Master Node',
+                                    name: 'internal_ip'),    
+                                string(
+                                    description: 'Enter the Hostname of Master Node',
+                                    name: 'master_hostname'),
+                                choice(
+                                    choices: ['false','true'],
+                                    description: 'Select true,if master Node need to act as a data node too',
+                                    name: 'data_node'),
+                                choice(
+                                    choices: ['true','false'],
+                                    description: 'Select true,if passwords need to generate for builtin user',
+                                    name: 'secure_cluster')    
+                            ]
+                        )
+                        cluster_name = multiInput.cluster_name?:''
+                        master_ip = multiInput.internal_ip?:''
+                        host_ip = multiInput.external_ip?:''
+                        master_hostname = multiInput.master_hostname?:''
+                        node_count = multiInput.node_count?:''
+                        data_node = multiInput.data_node?:''
+                        secure_cluster = multiInput.secure_cluster?:''
+                    }
+                    else{
+                        println("Given Inputs are mismatched, Please provide appropriate details")
+                        error "Execution of pipeline stopped"
+                    }
+                }
+            }
+        }
+        stage('Elasticsearch Installation'){
+            agent { label "${params.agent_name}" }
+            steps{
+                script{
+                    dir('Playbooks'){
+                        if("${params.install_type}".toString() == 'bcdr'){
+                            println("ES Installation for BCDR")
+                            sh " sudo chown ubuntu:ubuntu * -R"
+                            writeFile file: 'inventory', text: "[$instance_name] \n $host_ip ansible_user=ubuntu"
+                            sh "cp template.yml elasticsearch.yml"
+                            sh "sed -i 's/host_ip/$instance_name/g' elasticsearch.yml"
+                            sh "sed -i 's/role-name/elasticsearch/g' elasticsearch.yml"
+                            try{
+                                sh(script:"/usr/local/bin/ansible-playbook -i inventory elasticsearch.yml -e 'version=${params.es_version} cloud=$cloud' --tags=bcdr", returnStdout: true)
+                            }
+                            catch(all){
+                                println("Elasticsearch Installation Failed")
+                                currentBuild.result='FAILURE'
+                                error "Execution of pipeline stopped"
+                            }
+                        }    
+                        else if(("${params.install_type}".toString() == 'new') && ("$cluster_type".toString() == 'singlenode')){
+                            println("New Single Node ES Cluster Installation")
+                            writeFile file: 'inventory', text: "[$instance_name] \n $host_ip ansible_user=ubuntu"
+                            sh "cp template.yml elasticsearch.yml"
+                            sh "sed -i 's/host_ip/$instance_name/g' elasticsearch.yml"
+                            sh "sed -i 's/role-name/elasticsearch/g' elasticsearch.yml"
+                            println(cluster_name)
+                            println(instance_name)
+                            println(host_ip)
+                            println(cluster_type)
+                            println(master_ip)
+                            try{
+                                sh(script:"/usr/local/bin/ansible-playbook -i inventory elasticsearch.yml -e 'cluster_type=$cluster_type master_node=true data_node=true master_ip=$master_ip master_hostname=$master_hostname cluster_name=$cluster_name version=${params.es_version} cloud=$cloud secure_cluster=$secure_cluster' --tags=new", returnStdout: true)
+                            }
+                            catch(all){
+                                println("Elasticsearch Installation Failed")
+                                currentBuild.result='FAILURE'
+                                error "Execution of pipeline stopped"
+                            }
+                            if("$secure_cluster".toString() == 'true'){
+                                sh "touch passwordfile"
+                                sh(script: "/usr/local/bin/ansible $instance_name -i inventory -m shell -a '/usr/share/elasticsearch/bin/elasticsearch-setup-passwords auto -b' --become > passwordfile", returnStdout:true)
+                            }    
+                        }
+                        else if(("${params.install_type}".toString() == 'new') && ("$cluster_type".toString() == 'multinode')){
+                            println("New Multi Node ES Cluster Master Installation")
+                            writeFile file: 'masterinventory', text: "[$master_hostname] \n $host_ip ansible_user=ubuntu"
+                            sh "cp template.yml elasticsearch.yml"
+                            sh "sed -i 's/host_ip/$master_hostname/g' elasticsearch.yml"
+                            sh "sed -i 's/role-name/elasticsearch/g' elasticsearch.yml"
+                            println(cluster_name)
+                            println(master_ip)
+                            println(host_ip)
+                            println(master_hostname)
+                            println(data_node)
+                            println(secure_cluster)
+                            try{
+                                sh(script:"/usr/local/bin/ansible-playbook -i masterinventory elasticsearch.yml -e 'cluster_type=$cluster_type master_node=true data_node=$data_node master_ip=$master_ip master_hostname=$master_hostname cluster_name=$cluster_name version=${params.es_version} cloud=$cloud secure_cluster=$secure_cluster' --tags=new", returnStdout: true)
+                                println("Master Node Installed successfully")
+                            }
+                            catch(all){
+                                println("Elasticsearch Master Node Installation Failed")
+                                currentBuild.result='FAILURE'
+                                error "Execution of pipeline stopped"
+                            }
+                            sh "rm elasticsearch.yml"
+                            println(node_count)
+                            for (int i = 0; i<("$node_count".toInteger()); i++){
+                                def nodeInput = input(
+                                    id: 'nodeInput', message: 'Enter the required details for New ES Cluster Installation:?',
+                                    parameters: [ 
+                                        string(
+                                            description: 'Enter the Host name of the Data Node',
+                                            name: 'host_name'),
+                                        string(
+                                            description: 'Enter the IP Address of the Data Node',
+                                            name: 'host_ip'),
+                                    ]            
+                                )
+                                instance_name = nodeInput.host_name?:''
+                                host_ip = nodeInput.host_ip?:''
+                                println(host_ip)
+                                println(instance_name)
+                                println(cluster_type)
+                                writeFile file: 'inventory', text: "[$instance_name] \n $host_ip ansible_user=ubuntu"
+                                sh "cp template.yml elasticsearch.yml"
+                                sh "sed -i 's/host_ip/$instance_name/g' elasticsearch.yml"
+                                sh "sed -i 's/role-name/elasticsearch/g' elasticsearch.yml"
+                                try{
+                                    sh(script:"/usr/local/bin/ansible-playbook -i inventory elasticsearch.yml -e 'cluster_type=$cluster_type master_node=false data_node=true master_ip=$master_ip master_hostname=$master_hostname cluster_name=$cluster_name version=${params.es_version} cloud=$cloud secure_cluster=$secure_cluster' --tags=new", returnStdout: true)
+                                    println("Data Node-" + (i + 1 )+ "-installed successfully")
+                                }
+                                catch(all){
+                                    println("Elasticsearch Data Node Installation Failed")
+                                    currentBuild.result='FAILURE'
+                                    error "Execution of pipeline stopped"
+                                }
+                                sh "rm inventory elasticsearch.yml"
+                                print(i)    
+                            }
+                            if("$secure_cluster".toString() == 'true'){
+                                sh "touch passwordfile"
+                                sh(script: "/usr/local/bin/ansible $master_hostname -i masterinventory -m shell -a '/usr/share/elasticsearch/bin/elasticsearch-setup-passwords auto -b' --become > passwordfile", returnStdout:true)
+                            }    
+                        }
+                    }
+                }
+            }
+            post{
+                success{
+                    script{
+                        if("$secure_cluster".toString() == 'true'){
+                            dir('Playbooks'){
+                                archiveArtifacts 'passwordfile'
+                                sh "mv /tmp/adminpassfile adminpassfile"
+                                archiveArtifacts 'adminpassfile'
+                            }
+                            sh "rm /tmp/*.p12"
+                        }
+                    }            
+                    println("New ES Cluster Installed Successfully")
+                }
+            }
+        }
+    }
+}
+    
+        
